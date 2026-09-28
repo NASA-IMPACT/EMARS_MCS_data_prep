@@ -1,7 +1,8 @@
 """Prepare hourly EMARS–MCS DA NetCDF products (input, output, MCS limbs).
 
-Builds distance-weighted temperature superobservations on the EMARS grid and
-writes one-hour triples under ``EMARS_MCS_training_data/EMARS_MCS_DA_YYYYMMDD/``.
+Builds distance-weighted temperature superobservations on the EMARS grid
+(vertical match to local hybrid levels from ak, bk, ps) and writes one-hour
+triples under ``EMARS_MCS_training_data/EMARS_MCS_DA_YYYYMMDD/``.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ def lon360(x):
 R_MARS_KM = 3389.5
 # Floor so an obs exactly on the grid center does not get infinite weight.
 DIST_EPS_KM = 1.0
-# Floor on |ln(p_obs) - ln(pfull)| for vertical inverse-distance weight.
+# Floor on |ln(p_obs) - ln(p_hybrid)| for vertical inverse-distance weight.
 DIST_EPS_LNP = 0.05
 
 
@@ -170,19 +171,41 @@ def patch_mcs_limb_metadata(
         ds_bm.close()
 
 
-def superob_on_emars_grid(bundle: dict[str, Any], lat, lon, pfull_mb, xb):
-    """Distance-weighted super-obs on EMARS (pfull, lat, lon).
+def hybrid_pfull_pa(ak_pa, bk, ps_pa):
+    """Local full-level pressure (Pa) from half-level ak, bk and surface ps (Pa).
 
-    Each QC-pass MCS level is assigned to the nearest EMARS (lat, lon, pfull) cell,
-    then averaged with inverse-distance weights to that grid point:
-      w = 1/(r_h + ε_h) * 1/(|ln p - ln pfull| + ε_v)
-    where r_h is horizontal distance (km) from the obs footprint to the cell center.
+    p_half(k) = ak(k) + bk(k) * ps
+    p_full(k) = 0.5 * (p_half(k) + p_half(k+1))
+    """
+    ak_pa = np.asarray(ak_pa, dtype=np.float64)
+    bk = np.asarray(bk, dtype=np.float64)
+    ps_pa = np.asarray(ps_pa, dtype=np.float64)
+    if ps_pa.ndim == 0:
+        phalf = ak_pa + bk * float(ps_pa)
+        return 0.5 * (phalf[:-1] + phalf[1:])
+    phalf = ak_pa[:, None, None] + bk[:, None, None] * ps_pa[None, :, :]
+    return 0.5 * (phalf[:-1] + phalf[1:])
+
+
+def superob_on_emars_grid(bundle: dict[str, Any], lat, lon, ak_pa, bk, ps_pa, xb):
+    """Distance-weighted super-obs on EMARS hybrid levels (lat, lon, k).
+
+    Each QC-pass MCS level is assigned to the nearest EMARS (lat, lon) cell, then to
+    the nearest *local* hybrid full level at that column:
+      p_full(k,j,i) = 0.5 * [ak(k)+bk(k)*ps(j,i) + ak(k+1)+bk(k+1)*ps(j,i)]
+    Inverse-distance weights:
+      w = 1/(r_h + ε_h) * 1/(|ln p_obs - ln p_full(k,j,i)| + ε_v)
     σ_o uses the same weights on Temp_err (not reduced by N), then floor 3 K.
 
     Also bins MCS T_qual onto the same grid for all profiles (not only QC-pass).
     """
     nlev, nlat, nlon = xb.shape
-    pfull_pa = np.asarray(pfull_mb, dtype=np.float64) * 100.0
+    # Local hybrid full-level pressure at every column for this hour (Pa).
+    p_hyb_pa = hybrid_pfull_pa(ak_pa, bk, ps_pa)
+    if p_hyb_pa.shape != (nlev, nlat, nlon):
+        raise ValueError(
+            f"hybrid pfull shape {p_hyb_pa.shape} != xb shape {(nlev, nlat, nlon)}"
+        )
     sum_wt = np.zeros((nlev, nlat, nlon), dtype=np.float64)
     sum_we = np.zeros((nlev, nlat, nlon), dtype=np.float64)
     sum_w = np.zeros((nlev, nlat, nlon), dtype=np.float64)
@@ -225,7 +248,9 @@ def superob_on_emars_grid(bundle: dict[str, Any], lat, lon, pfull_mb, xb):
                 continue
             j = int(np.argmin(np.abs(lat - olat)))
             i = int(np.argmin(np.abs(lon - lon360(olon))))
-            k_idx = int(np.argmin(np.abs(pfull_pa - p[idx])))
+            # Vertical: nearest local hybrid full level at this column
+            p_col = p_hyb_pa[:, j, i]
+            k_idx = int(np.argmin(np.abs(p_col - p[idx])))
 
             # Gridded T_qual from every profile that has a usable T level here
             if tq_finite:
@@ -237,7 +262,10 @@ def superob_on_emars_grid(bundle: dict[str, Any], lat, lon, pfull_mb, xb):
                 continue
 
             r_h = horiz_dist_km(float(lat[j]), float(lon[i]), float(olat), float(olon))
-            r_v = abs(np.log(p[idx]) - np.log(pfull_pa[k_idx]))
+            p_lev = float(p_col[k_idx])
+            if not (np.isfinite(p_lev) and p_lev > 0):
+                continue
+            r_v = abs(np.log(p[idx]) - np.log(p_lev))
             w = (1.0 / (r_h + DIST_EPS_KM)) * (1.0 / (r_v + DIST_EPS_LNP))
             sum_wt[k_idx, j, i] += w * t[idx]
             sum_we[k_idx, j, i] += w * e[idx]
@@ -302,12 +330,14 @@ def write_input_nc(
             out.setncattr(
                 "innovation",
                 "d = y - H(x^b) with H = identity on the EMARS grid after superobbing "
-                "(nearest cell, nearest pfull)",
+                "(nearest cell, nearest local hybrid full level)",
             )
             out.setncattr(
                 "superob",
                 "y = inverse-distance-weighted mean of QC-pass MCS T assigned to nearest "
-                "(lat, lon, pfull); w = 1/(r_h_km+1) * 1/(|ln p - ln pfull|+0.05); "
+                "(lat, lon) and nearest local hybrid full level "
+                "p_full(k,j,i)=0.5*[(ak+bk*ps)_k + (ak+bk*ps)_{k+1}]; "
+                "w = 1/(r_h_km+1) * 1/(|ln p - ln p_full|+0.05); "
                 "sigma_o = same weights on Temp_err (not reduced by N), then max(sigma_o, 3 K)",
             )
             out.setncattr(
@@ -340,8 +370,10 @@ def write_input_nc(
             v_y.setncattr("units", "K")
             v_y.setncattr(
                 "equation",
-                "y = sum(w*T)/sum(w); w = 1/(r_h+1km) * 1/(|ln p - ln pfull|+0.05); "
-                "nearest EMARS (lat, lon, pfull); footprint from level_lat/lon when available",
+                "y = sum(w*T)/sum(w); w = 1/(r_h+1km) * 1/(|ln p - ln p_hybrid|+0.05); "
+                "nearest EMARS (lat, lon) then nearest local hybrid full level "
+                "p_hybrid=0.5*((ak+bk*ps)_k+(ak+bk*ps)_{k+1}); "
+                "footprint from level_lat/lon when available",
             )
             v_y.setncattr("ml_role", "input y (super-obs to assimilate)")
 
@@ -563,7 +595,8 @@ def prepare_da_hourly(
     ds_bm = Dataset(paths["back_mean"])
     lat = np.array(ds_bm.variables["lat"][:], dtype=np.float64)
     lon = np.array(ds_bm.variables["lon"][:], dtype=np.float64)
-    pfull_mb = np.array(ds_bm.variables["pfull"][:], dtype=np.float64)
+    ak_pa = np.array(ds_bm.variables["ak"][:], dtype=np.float64)
+    bk = np.array(ds_bm.variables["bk"][:], dtype=np.float64)
     ds_bm.close()
 
     results = []
@@ -576,6 +609,7 @@ def prepare_da_hourly(
 
     available = set(v1.emars_hours_on_day(table, y, m, d))
     print(f"[prep] EMARS hours on {earth_date}: {sorted(available)}")
+    print("[prep] vertical match: local hybrid p_full(k,j,i) from ak, bk, ps")
 
     for hour in hours:
         stamp = f"{y:04d}{m:02d}{d:02d}{hour:02d}"
@@ -623,9 +657,10 @@ def prepare_da_hourly(
 
         ds_bm = Dataset(paths["back_mean"])
         xb = np.array(v1._read_slice(ds_bm.variables["t"], t_idx), dtype=np.float32)
+        ps_pa = np.array(v1._read_slice(ds_bm.variables["ps"], t_idx), dtype=np.float64)
         ds_bm.close()
         y_s, sig, d_inn, m_o, n_raw, t_qual_flag = superob_on_emars_grid(
-            bundle, lat, lon, pfull_mb, xb
+            bundle, lat, lon, ak_pa, bk, ps_pa, xb
         )
         print(
             f"[hour {hour:02d}] super-obs filled cells={int(m_o.sum())}  "

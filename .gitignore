@@ -4,6 +4,10 @@ logs/*
 outputs/
 EMARS_MCS_training_data/*
 !EMARS_MCS_training_data/.gitkeep
+EMARS_MCS_training_data_weighted_average/*
+!EMARS_MCS_training_data_weighted_average/.gitkeep
+EMARS_MCS_training_data_hybrid_vertical/*
+!EMARS_MCS_training_data_hybrid_vertical/.gitkeep
 
 # Python
 __pycache__/
